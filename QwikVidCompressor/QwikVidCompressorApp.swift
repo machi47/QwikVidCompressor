@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct QwikVidCompresserApp: App {
+struct QwikVidCompressorApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
