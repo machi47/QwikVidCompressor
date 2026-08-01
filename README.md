@@ -73,16 +73,20 @@ The output uses H.264 Main profile, AAC audio, `yuv420p`, and fast-start MP4 met
 
 ## Troubleshooting
 
-**FFmpeg Required**  
+**FFmpeg Required**
+
 Run `brew install ffmpeg`, then reopen the app.
 
-**macOS says the developer cannot be verified**  
+**macOS says the developer cannot be verified**
+
 Right-click `QwikVidCompressor.app`, choose **Open**, and confirm once. Subsequent launches work normally.
 
-**The result is much smaller or shorter than the original**  
+**The result is much smaller or shorter than the original**
+
 Discord's free 10 MB limit can be extremely restrictive for long videos. Keep the balance slider to the left to preserve timing, or move it right to trade duration for clearer frames.
 
-**Compression fails**  
+**Compression fails**
+
 Expand **Technical details** beneath the error. The app preserves the relevant FFmpeg output so the actual codec, permission, disk-space, or input-file problem is visible.
 
 ## Build from source
