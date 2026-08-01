@@ -39,11 +39,11 @@ QwikVidCompressor requires macOS 13 Ventura or newer. Homebrew installations on 
 ## Use
 
 1. Drop, paste, or select a video.
-2. Choose **Twitter** or **Discord**.
-3. Optionally expand **Options**:
-   - Choose **Trim Before Compressing** to set the beginning/end or mark middle cuts.
+2. Optionally expand **More Options**:
+   - Choose **Edit…** beside **Trim & Cuts** to set the beginning/end or mark middle cuts.
    - Leave the balance at **Keep timing** to preserve playback speed.
    - Move toward **Sharper frames** to permit shortening when an unusually restrictive size target would otherwise require severe quality loss.
+3. Choose **Twitter** or **Discord** as the final output target. The app explains whether the edited result already fits, only needs its edits applied, needs compatibility conversion, or requires size reduction.
 4. Press **Compress for Twitter** or **Compress for Discord**.
 
 The result is saved beside the source as `filename_twitter.mp4` or `filename_discord.mp4`. Existing source files are never modified.
@@ -59,7 +59,7 @@ Limits can change. The values above follow the official [Discord attachment docu
 
 ## How compression works
 
-QwikVidCompressor first checks whether the source already meets the selected platform's constraints. Compatible files take a fast stream-copy path, avoiding needless quality loss.
+QwikVidCompressor first checks the edited duration and estimated edited size against the selected platform's constraints. Compatible untouched files take a fast stream-copy path, avoiding needless quality loss. If trimming makes a video fit, the app applies those edits at source-quality settings instead of forcing size reduction.
 
 When conversion is needed, the app:
 

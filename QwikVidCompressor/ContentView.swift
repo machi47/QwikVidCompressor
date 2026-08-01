@@ -8,6 +8,7 @@ struct ContentView: View {
     @State private var isLoading = false
     @State private var optionsExpanded = false
     @State private var trimEditorExpanded = false
+    @State private var technicalDetailsExpanded = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -101,22 +102,13 @@ struct ContentView: View {
             Divider()
                 .padding(.horizontal, 20)
 
-            Picker("Platform", selection: $platform) {
-                ForEach(Platform.allCases, id: \.self) { selectedPlatform in
-                    Text(selectedPlatform.rawValue).tag(selectedPlatform)
-                }
-            }
-            .pickerStyle(.segmented)
-            .padding(.horizontal, 20)
-            .disabled(compressor.isCompressing)
-            .onChange(of: platform) { _ in
-                compressor.reset()
-            }
-
-            platformInfoView
+            optionsView(video)
                 .padding(.horizontal, 20)
 
-            optionsView(video)
+            Divider()
+                .padding(.horizontal, 20)
+
+            platformSelectionView(video)
                 .padding(.horizontal, 20)
 
             Spacer(minLength: 4)
@@ -195,84 +187,136 @@ struct ContentView: View {
         }
     }
 
-    private var platformInfoView: some View {
-        HStack {
-            Label(platform.limitDescription, systemImage: "info.circle")
-                .font(.caption)
-                .foregroundColor(.secondary)
-            Spacer()
+    private func platformSelectionView(_ video: VideoInfo) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Picker("Platform", selection: $platform) {
+                ForEach(Platform.allCases, id: \.self) { selectedPlatform in
+                    Text(selectedPlatform.rawValue).tag(selectedPlatform)
+                }
+            }
+            .pickerStyle(.segmented)
+            .disabled(compressor.isCompressing)
+            .onChange(of: platform) { _ in
+                // Platform changes intentionally preserve every edit and
+                // preference; only a result made for the old target is cleared.
+                technicalDetailsExpanded = false
+                compressor.reset()
+            }
+
+            HStack {
+                Label(platform.limitDescription, systemImage: "info.circle")
+                Spacer()
+            }
+            .font(.caption)
+            .foregroundColor(.secondary)
+
+            let requirement = VideoCompressor.requirement(video: video, edit: edit, platform: platform)
+            Label(requirement.message, systemImage: requirement.systemImage)
+                .font(.caption.weight(.medium))
+                .foregroundColor(requirement == .compression ? .orange : .green)
         }
     }
 
     private func optionsView(_ video: VideoInfo) -> some View {
-        DisclosureGroup(isExpanded: $optionsExpanded) {
-            VStack(spacing: 12) {
-                Button {
-                    withAnimation(.easeInOut(duration: 0.22)) {
-                        trimEditorExpanded.toggle()
+        VStack(spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.22)) {
+                    optionsExpanded.toggle()
+                    if !optionsExpanded {
+                        trimEditorExpanded = false
                     }
-                } label: {
-                    HStack {
-                        Label(
-                            edit.hasTimelineEdits(for: video.duration) ? "Edit Trims & Cuts" : "Trim Before Compressing",
-                            systemImage: "scissors"
-                        )
-                        Spacer()
-                        Image(systemName: trimEditorExpanded ? "chevron.up" : "chevron.down")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                    .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
-                .disabled(compressor.isCompressing)
-
-                if trimEditorExpanded {
-                    TrimEditorView(video: video, edit: $edit)
-                        .transition(.opacity.combined(with: .move(edge: .top)))
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: "slider.horizontal.3")
+                    Text(optionsSummary(video))
+                        .font(.subheadline.weight(.medium))
+                    Spacer()
+                    Image(systemName: optionsExpanded ? "chevron.up" : "chevron.down")
+                        .font(.caption.weight(.semibold))
+                        .foregroundColor(.secondary)
                 }
-
-                Divider()
-
-                VStack(spacing: 5) {
-                    HStack {
-                        Text("When heavy compression is needed")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                        Spacer()
-                        Text(balanceName)
-                            .font(.caption.weight(.medium))
-                    }
-
-                    Slider(value: $edit.clarityPreference, in: 0...1, step: 0.25)
-                        .disabled(compressor.isCompressing)
-
-                    HStack {
-                        Text("Keep timing")
-                        Spacer()
-                        Text("Sharper frames")
-                    }
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-                }
-                .help("Sharper frames may shorten very large videos; Keep timing preserves playback speed and lowers resolution or detail instead.")
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 7)
+                .contentShape(Rectangle())
             }
-            .padding(.top, 10)
-        } label: {
-            Label(optionsSummary(video), systemImage: "slider.horizontal.3")
-                .font(.subheadline.weight(.medium))
+            .buttonStyle(.plain)
+            .disabled(compressor.isCompressing)
+            .accessibilityLabel(optionsExpanded ? "Hide More Options" : "Show More Options")
+
+            if optionsExpanded {
+                VStack(spacing: 12) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "scissors")
+                            .foregroundColor(.secondary)
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Trim & Cuts")
+                            Text(editSummary(video))
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+
+                        Spacer()
+
+                        Button(trimEditorExpanded ? "Done" : "Edit…") {
+                            withAnimation(.easeInOut(duration: 0.22)) {
+                                trimEditorExpanded.toggle()
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(compressor.isCompressing)
+                    }
+
+                    if trimEditorExpanded {
+                        TrimEditorView(video: video, edit: $edit)
+                            .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
+
+                    Divider()
+
+                    VStack(spacing: 5) {
+                        HStack {
+                            Text("Compression tradeoff")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            Spacer()
+                            Text(balanceName)
+                                .font(.caption.weight(.medium))
+                        }
+
+                        Slider(value: $edit.clarityPreference, in: 0...1, step: 0.25)
+                            .disabled(compressor.isCompressing)
+
+                        HStack {
+                            Text("Keep timing")
+                            Spacer()
+                            Text("Sharper frames")
+                        }
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                    }
+                    .help("This is only used when the edited video still needs compression. Sharper frames may shorten it; Keep timing lowers detail instead.")
+                }
+                .padding(.top, 8)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
         }
         .disabled(compressor.isCompressing)
-        .onChange(of: optionsExpanded) { expanded in
-            if !expanded {
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    trimEditorExpanded = false
-                }
-            }
-        }
         .onChange(of: edit) { _ in
             compressor.reset()
         }
+    }
+
+    private func editSummary(_ video: VideoInfo) -> String {
+        guard edit.hasTimelineEdits(for: video.duration) else {
+            return "Use the whole video"
+        }
+        let cutText = edit.cuts.isEmpty
+            ? ""
+            : edit.cuts.count == 1 ? " • 1 cut" : " • \(edit.cuts.count) cuts"
+        return "Output \(edit.editedDuration(for: video.duration).qwikTimecode)\(cutText)"
     }
 
     private var balanceName: String {
@@ -289,9 +333,9 @@ struct ContentView: View {
         let editCount = edit.cuts.count
         let hasTrim = edit.hasTimelineEdits(for: video.duration)
         if hasTrim {
-            return editCount == 1 ? "Options • 1 cut" : "Options • \(editCount) cuts"
+            return editCount == 1 ? "More Options • 1 cut" : "More Options • \(editCount) cuts"
         }
-        return "Options"
+        return "More Options"
     }
 
     private var progressView: some View {
@@ -369,6 +413,7 @@ struct ContentView: View {
 
     private func compressButton(video: VideoInfo) -> some View {
         Button {
+            technicalDetailsExpanded = false
             Task {
                 await compressor.compress(video: video, edit: edit, for: platform)
             }
@@ -390,14 +435,36 @@ struct ContentView: View {
                     .fixedSize(horizontal: false, vertical: true)
 
                 if let details = compressor.errorDetails {
-                    DisclosureGroup("Technical details") {
-                        Text(details)
-                            .font(.system(.caption2, design: .monospaced))
-                            .foregroundColor(.secondary)
-                            .textSelection(.enabled)
-                            .padding(.top, 4)
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.18)) {
+                            technicalDetailsExpanded.toggle()
+                        }
+                    } label: {
+                        HStack {
+                            Label("Technical Details", systemImage: "terminal")
+                            Spacer()
+                            Image(systemName: technicalDetailsExpanded ? "chevron.up" : "chevron.down")
+                                .font(.caption.weight(.semibold))
+                                .foregroundColor(.secondary)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 5)
+                        .contentShape(Rectangle())
                     }
-                    .font(.caption)
+                    .buttonStyle(.plain)
+
+                    if technicalDetailsExpanded {
+                        ScrollView {
+                            Text(details)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundColor(.secondary)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.top, 4)
+                        }
+                        .frame(maxHeight: 140)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                    }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -416,6 +483,7 @@ struct ContentView: View {
                 edit = VideoEdit(duration: info.duration)
                 optionsExpanded = false
                 trimEditorExpanded = false
+                technicalDetailsExpanded = false
             } catch {
                 compressor.error = "Failed to load video: \(error.localizedDescription)"
             }
@@ -428,6 +496,7 @@ struct ContentView: View {
         edit = VideoEdit(duration: 0)
         optionsExpanded = false
         trimEditorExpanded = false
+        technicalDetailsExpanded = false
         compressor.reset()
     }
 
