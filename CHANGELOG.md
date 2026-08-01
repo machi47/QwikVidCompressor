@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.0.2 — 2026-08-01
+
+### Fixed
+
+- Made the complete Trim & Cuts row—including its label, summary, empty space, and chevron—the button that opens and closes the editor.
+- Removed the undersized Edit button that made the row's apparent click target misleading.
+- Added enough finished-state window height to keep both result buttons fully visible after editing and compression.
+
 ## 2.0.1 — 2026-08-01
 
 ### Fixed

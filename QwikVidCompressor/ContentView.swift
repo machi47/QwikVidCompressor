@@ -30,7 +30,11 @@ struct ContentView: View {
 
     private var windowHeight: CGFloat {
         guard videoInfo != nil else { return 500 }
-        if trimEditorExpanded { return 820 }
+        if trimEditorExpanded {
+            // The completed-result controls add one more row below the editor.
+            // Give that state just enough room without enlarging normal editing.
+            return compressor.outputURL == nil ? 820 : 844
+        }
         if optionsExpanded { return 620 }
         return 500
     }
@@ -246,28 +250,36 @@ struct ContentView: View {
 
             if optionsExpanded {
                 VStack(spacing: 12) {
-                    HStack(spacing: 10) {
-                        Image(systemName: "scissors")
-                            .foregroundColor(.secondary)
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.22)) {
+                            trimEditorExpanded.toggle()
+                        }
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: "scissors")
+                                .foregroundColor(.secondary)
 
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Trim & Cuts")
-                            Text(editSummary(video))
-                                .font(.caption)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Trim & Cuts")
+                                Text(editSummary(video))
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+
+                            Spacer()
+
+                            Image(systemName: trimEditorExpanded ? "chevron.up" : "chevron.right")
+                                .font(.caption.weight(.semibold))
                                 .foregroundColor(.secondary)
                         }
-
-                        Spacer()
-
-                        Button(trimEditorExpanded ? "Done" : "Edit…") {
-                            withAnimation(.easeInOut(duration: 0.22)) {
-                                trimEditorExpanded.toggle()
-                            }
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
-                        .disabled(compressor.isCompressing)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 6)
+                        .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
+                    .disabled(compressor.isCompressing)
+                    .accessibilityLabel(trimEditorExpanded ? "Hide Trim and Cuts" : "Edit Trim and Cuts")
+                    .accessibilityHint("Opens the video timeline editor")
 
                     if trimEditorExpanded {
                         TrimEditorView(video: video, edit: $edit)
