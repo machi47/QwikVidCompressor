@@ -1,5 +1,22 @@
 # Changelog
 
+## 2.0.1 — 2026-08-01
+
+### Fixed
+
+- Replaced SwiftUI's crashing `VideoPlayer` bridge with the native macOS `AVPlayerView` on macOS 15.
+- Made the entire More Options and Technical Details rows clickable.
+- Prevented short edited videos from being assigned absurdly high bitrates from the 512 MB X allowance.
+- Capped X output at its documented 25 Mbps maximum bitrate.
+
+### Improved
+
+- Added direct draggable handles for start/end trims and middle-cut selections.
+- Moved platform selection to the final step and preserved every edit when switching platforms.
+- Added a preflight message explaining whether the video needs no work, edits only, compatibility conversion, or size reduction.
+- Added a source-quality edit path when trimming makes a video fit without compression.
+- Refined the options hierarchy around compact native macOS controls.
+
 ## 2.0.0 — 2026-08-01
 
 ### Added

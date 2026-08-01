@@ -31,6 +31,13 @@ enum Platform: String, CaseIterable {
         }
     }
 
+    var maximumVideoBitrate: Int {
+        switch self {
+        case .twitter: return 25_000_000
+        case .discord: return 50_000_000
+        }
+    }
+
     var fileSuffix: String {
         switch self {
         case .twitter: return "_twitter"
@@ -46,6 +53,31 @@ enum Platform: String, CaseIterable {
     }
 }
 
+enum CompressionRequirement: Equatable {
+    case ready
+    case editsOnly
+    case compatibilityOnly
+    case compression
+
+    var message: String {
+        switch self {
+        case .ready: return "Already fits — no quality loss"
+        case .editsOnly: return "Fits after editing — no size reduction needed"
+        case .compatibilityOnly: return "Fits — only a compatibility conversion is needed"
+        case .compression: return "The edited video will be optimized for this limit"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .ready: return "checkmark.circle"
+        case .editsOnly: return "scissors"
+        case .compatibilityOnly: return "arrow.triangle.2.circlepath"
+        case .compression: return "arrow.down.circle"
+        }
+    }
+}
+
 private struct CompressionPlan {
     let segments: [VideoSegment]
     let editedDuration: Double
@@ -57,6 +89,7 @@ private struct CompressionPlan {
     let height: Int
     let frameRate: Double
     let useStreamCopy: Bool
+    let preserveSourceQuality: Bool
 }
 
 private enum CompressionFailure: LocalizedError {
@@ -175,6 +208,28 @@ final class VideoCompressor: ObservableObject {
         ffmpegPath != nil
     }
 
+    static func requirement(video: VideoInfo, edit: VideoEdit, platform: Platform) -> CompressionRequirement {
+        let editedDuration = edit.editedDuration(for: video.duration)
+        let durationFits = platform.maxDuration.map { editedDuration <= $0 + 0.05 } ?? true
+        let estimatedEditedSize = Double(video.fileSize)
+            * editedDuration / max(0.001, video.duration)
+        let estimatedSizeFits = estimatedEditedSize < Double(platform.workingFileSize)
+        let timelineChanged = edit.hasTimelineEdits(for: video.duration)
+        let compatible = isStreamCopyCompatible(
+            video: video,
+            platform: platform,
+            effectiveDuration: editedDuration
+        )
+
+        if !timelineChanged, estimatedSizeFits, durationFits, compatible {
+            return .ready
+        }
+        if estimatedSizeFits, durationFits {
+            return timelineChanged ? .editsOnly : .compatibilityOnly
+        }
+        return .compression
+    }
+
     func compress(video: VideoInfo, edit: VideoEdit, for platform: Platform) async {
         guard let ffmpeg = Self.ffmpegPath else {
             error = "FFmpeg not found. Install it with brew install ffmpeg."
@@ -222,6 +277,28 @@ final class VideoCompressor: ObservableObject {
                     removeFileIfPresent(at: outputURL)
                     progress = 0
                     statusMessage = "Converting for compatibility…"
+                    try await transcode(
+                        video: video,
+                        plan: &plan,
+                        platform: platform,
+                        ffmpegPath: ffmpeg,
+                        outputURL: outputURL
+                    )
+                }
+            } else if plan.preserveSourceQuality {
+                statusMessage = edit.hasTimelineEdits(for: video.duration)
+                    ? "Applying edits without size reduction…"
+                    : "Converting without size reduction…"
+                try await transcodePreservingQuality(
+                    video: video,
+                    plan: plan,
+                    platform: platform,
+                    ffmpegPath: ffmpeg,
+                    outputURL: outputURL
+                )
+
+                if fileSize(at: outputURL) > platform.maxFileSize {
+                    statusMessage = "The edited result needs light compression…"
                     try await transcode(
                         video: video,
                         plan: &plan,
@@ -283,10 +360,9 @@ final class VideoCompressor: ObservableObject {
         let editedDuration = segments.reduce(0) { $0 + $1.duration }
         guard editedDuration > 0.05 else { throw CompressionFailure.noVideoLeft }
 
-        let timelineChanged = edit.hasTimelineEdits(for: video.duration)
-        let platformCompatible = isStreamCopyCompatible(video: video, platform: platform)
-        let underLimit = video.fileSize < platform.workingFileSize
-        let useStreamCopy = !timelineChanged && underLimit && platformCompatible
+        let requirement = Self.requirement(video: video, edit: edit, platform: platform)
+        let useStreamCopy = requirement == .ready
+        let preserveSourceQuality = requirement == .editsOnly || requirement == .compatibilityOnly
 
         let requiredDurationSpeed: Double
         if let maximumDuration = platform.maxDuration {
@@ -314,18 +390,33 @@ final class VideoCompressor: ObservableObject {
         let outputDuration = editedDuration / speed
         let totalBitrate = Double(platform.workingFileSize) * 8 / max(0.1, outputDuration)
         let audioBitrate = chooseAudioBitrate(totalBitrate: totalBitrate, hasAudio: video.hasAudio)
-        let videoBitrate = max(24_000, Int(totalBitrate) - audioBitrate)
-        let frameRate = chooseFrameRate(
-            source: video.frameRate,
-            videoBitrate: videoBitrate,
-            platformMaximum: platform.maximumFrameRate
+        let availableVideoBitrate = max(24_000, Int(totalBitrate) - audioBitrate)
+        // The platform allowance is a ceiling, not a target. Giving a short
+        // clip the entire 512 MB X budget can request an encoder-breaking
+        // bitrate over 1 Gbps. Preserve useful source quality without
+        // exceeding either the remaining budget or the platform ceiling.
+        let videoBitrate = max(
+            24_000,
+            min(availableVideoBitrate, min(Int(desiredVideoBitrate), platform.maximumVideoBitrate))
         )
-        let resolution = chooseResolution(
-            source: video.resolution,
-            videoBitrate: videoBitrate,
-            frameRate: frameRate,
-            platform: platform
-        )
+        let frameRate: Double
+        let resolution: (width: Int, height: Int)
+        if preserveSourceQuality {
+            frameRate = min(max(12, video.frameRate), platform.maximumFrameRate)
+            resolution = maximumDimensions(for: video.resolution, platform: platform)
+        } else {
+            frameRate = chooseFrameRate(
+                source: video.frameRate,
+                videoBitrate: videoBitrate,
+                platformMaximum: platform.maximumFrameRate
+            )
+            resolution = chooseResolution(
+                source: video.resolution,
+                videoBitrate: videoBitrate,
+                frameRate: frameRate,
+                platform: platform
+            )
+        }
 
         return CompressionPlan(
             segments: segments,
@@ -337,17 +428,22 @@ final class VideoCompressor: ObservableObject {
             width: resolution.width,
             height: resolution.height,
             frameRate: frameRate,
-            useStreamCopy: useStreamCopy
+            useStreamCopy: useStreamCopy,
+            preserveSourceQuality: preserveSourceQuality
         )
     }
 
-    private func isStreamCopyCompatible(video: VideoInfo, platform: Platform) -> Bool {
+    private static func isStreamCopyCompatible(
+        video: VideoInfo,
+        platform: Platform,
+        effectiveDuration: Double? = nil
+    ) -> Bool {
         switch platform {
         case .discord:
             return ["h264", "hevc", "av1"].contains(video.videoCodec)
         case .twitter:
             guard video.videoCodec == "h264",
-                  video.duration <= 140.05,
+                  (effectiveDuration ?? video.duration) <= 140.05,
                   video.frameRate <= 40.05 else { return false }
             let width = video.resolution.width
             let height = video.resolution.height
@@ -447,6 +543,48 @@ final class VideoCompressor: ObservableObject {
 
     private var baseArguments: [String] {
         ["-hide_banner", "-nostdin", "-y", "-progress", "pipe:1", "-nostats"]
+    }
+
+    private func transcodePreservingQuality(
+        video: VideoInfo,
+        plan: CompressionPlan,
+        platform: Platform,
+        ffmpegPath: String,
+        outputURL: URL
+    ) async throws {
+        removeFileIfPresent(at: outputURL)
+        let includeAudio = video.hasAudio
+        let filterGraph = buildFilterGraph(video: video, plan: plan, includeAudio: includeAudio)
+        var arguments = baseArguments + [
+            "-i", video.url.path,
+            "-filter_complex", filterGraph,
+            "-map", "[vout]",
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-profile:v", "main",
+            "-pix_fmt", "yuv420p",
+            "-crf", "18",
+            "-maxrate", "\(platform.maximumVideoBitrate)",
+            "-bufsize", "\(platform.maximumVideoBitrate * 2)"
+        ]
+
+        if includeAudio {
+            arguments += ["-map", "[aout]", "-c:a", "aac", "-b:a", "\(plan.audioBitrate)"]
+        } else {
+            arguments += ["-an"]
+        }
+        arguments += [
+            "-tag:v", "avc1",
+            "-movflags", "+faststart",
+            outputURL.path
+        ]
+
+        try await runFFmpeg(
+            path: ffmpegPath,
+            args: arguments,
+            duration: plan.outputDuration,
+            progressRange: 0...0.96
+        )
     }
 
     private func transcode(

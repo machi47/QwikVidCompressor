@@ -6,20 +6,25 @@ struct DropZoneView: View {
     @State private var isTargeted = false
 
     var body: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "film")
-                .font(.system(size: 48))
-                .foregroundColor(.secondary)
+        Button(action: browseForVideo) {
+            VStack(spacing: 12) {
+                Image(systemName: "film")
+                    .font(.system(size: 48))
+                    .foregroundColor(.secondary)
 
-            Text("Drop video here")
-                .font(.title2)
-                .fontWeight(.medium)
+                Text("Drop video here")
+                    .font(.title2)
+                    .fontWeight(.medium)
 
-            Text("or press \u{2318}V to paste, or click to browse")
-                .font(.caption)
-                .foregroundColor(.secondary)
+                Text("or press \u{2318}V to paste, or click to browse")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .contentShape(Rectangle())
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .buttonStyle(.plain)
+        .accessibilityLabel("Choose Video")
         .background(
             RoundedRectangle(cornerRadius: 12)
                 .strokeBorder(
@@ -32,9 +37,6 @@ struct DropZoneView: View {
                 .fill(isTargeted ? Color.accentColor.opacity(0.05) : Color.clear)
         )
         .contentShape(Rectangle())
-        .onTapGesture {
-            browseForVideo()
-        }
         .onDrop(of: [.fileURL], isTargeted: $isTargeted) { providers in
             handleDrop(providers)
             return true
