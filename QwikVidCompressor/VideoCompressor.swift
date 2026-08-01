@@ -4,11 +4,17 @@ enum Platform: String, CaseIterable {
     case twitter = "Twitter"
     case discord = "Discord"
 
+    /// Platform limits are expressed as decimal megabytes by their respective
+    /// help centers. A smaller working target leaves room for MP4 metadata.
     var maxFileSize: Int64 {
         switch self {
-        case .twitter: return 512 * 1024 * 1024
-        case .discord: return 50 * 1024 * 1024
+        case .twitter: return 512_000_000
+        case .discord: return 10_000_000
         }
+    }
+
+    var workingFileSize: Int64 {
+        Int64(Double(maxFileSize) * 0.94)
     }
 
     var maxDuration: Double? {
@@ -18,344 +24,777 @@ enum Platform: String, CaseIterable {
         }
     }
 
+    var maximumFrameRate: Double {
+        switch self {
+        case .twitter: return 40
+        case .discord: return 60
+        }
+    }
+
     var fileSuffix: String {
         switch self {
         case .twitter: return "_twitter"
         case .discord: return "_discord"
         }
     }
+
+    var limitDescription: String {
+        switch self {
+        case .twitter: return "Free • 512 MB • 2:20 • 40 fps"
+        case .discord: return "Free • under 10 MB"
+        }
+    }
+}
+
+private struct CompressionPlan {
+    let segments: [VideoSegment]
+    let editedDuration: Double
+    let speed: Double
+    let outputDuration: Double
+    var videoBitrate: Int
+    let audioBitrate: Int
+    let width: Int
+    let height: Int
+    let frameRate: Double
+    let useStreamCopy: Bool
+}
+
+private enum CompressionFailure: LocalizedError {
+    case noVideoLeft
+    case couldNotCreateOutput
+    case outputTooLarge(actual: Int64, limit: Int64)
+    case durationTooLong(actual: Double, limit: Double)
+    case ffmpeg(status: Int32, message: String, details: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .noVideoLeft:
+            return "The trims and cuts remove the entire video."
+        case .couldNotCreateOutput:
+            return "FFmpeg finished, but no output file was created."
+        case let .outputTooLarge(actual, limit):
+            let actualText = ByteCountFormatter.string(fromByteCount: actual, countStyle: .file)
+            let limitText = ByteCountFormatter.string(fromByteCount: limit, countStyle: .file)
+            return "The result is still \(actualText), above the \(limitText) limit."
+        case let .durationTooLong(actual, limit):
+            return "The result is \(actual.qwikTimecode), above the \(limit.qwikTimecode) limit."
+        case let .ffmpeg(_, message, _):
+            return message
+        }
+    }
+
+    var diagnosticDetails: String? {
+        if case let .ffmpeg(status, _, details) = self {
+            return "FFmpeg exit code \(status)\n\n\(details)"
+        }
+        return nil
+    }
+}
+
+private final class LockedTextBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var text = ""
+
+    func append(_ value: String) {
+        lock.lock()
+        text.append(value)
+        if text.count > 80_000 {
+            text = String(text.suffix(60_000))
+        }
+        lock.unlock()
+    }
+
+    func contents() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return text
+    }
+}
+
+private final class ContinuationGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var resumed = false
+
+    func resume(
+        _ continuation: CheckedContinuation<Void, Error>,
+        with result: Result<Void, Error>
+    ) {
+        lock.lock()
+        guard !resumed else {
+            lock.unlock()
+            return
+        }
+        resumed = true
+        lock.unlock()
+        continuation.resume(with: result)
+    }
+}
+
+private final class CancellationState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    func set(_ value: Bool) {
+        lock.lock()
+        cancelled = value
+        lock.unlock()
+    }
+
+    func get() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
 }
 
 @MainActor
-class VideoCompressor: ObservableObject {
+final class VideoCompressor: ObservableObject {
     @Published var progress: Double = 0
     @Published var isCompressing = false
     @Published var error: String?
+    @Published var errorDetails: String?
     @Published var outputURL: URL?
     @Published var outputFileSize: Int64 = 0
+    @Published var statusMessage = ""
 
     private var process: Process?
+    private let cancellationState = CancellationState()
 
     static var ffmpegPath: String? {
-        let paths = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
-        return paths.first { FileManager.default.fileExists(atPath: $0) }
+        let paths = [
+            Bundle.main.path(forResource: "ffmpeg", ofType: nil),
+            "/opt/homebrew/bin/ffmpeg",
+            "/opt/homebrew/opt/ffmpeg/bin/ffmpeg",
+            "/usr/local/bin/ffmpeg",
+            "/usr/local/opt/ffmpeg/bin/ffmpeg"
+        ].compactMap { $0 }
+        return paths.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
     static var ffmpegInstalled: Bool {
         ffmpegPath != nil
     }
 
-    func compress(video: VideoInfo, for platform: Platform) async {
+    func compress(video: VideoInfo, edit: VideoEdit, for platform: Platform) async {
         guard let ffmpeg = Self.ffmpegPath else {
-            error = "FFmpeg not found"
+            error = "FFmpeg not found. Install it with brew install ffmpeg."
             return
         }
 
         isCompressing = true
+        cancellationState.set(false)
         progress = 0
         error = nil
+        errorDetails = nil
         outputURL = nil
+        outputFileSize = 0
+        statusMessage = "Planning compression…"
 
-        let outputPath = buildOutputPath(for: video.url, platform: platform)
-        let outputURL = URL(fileURLWithPath: outputPath)
-
-        // Remove existing output file
-        try? FileManager.default.removeItem(atPath: outputPath)
+        let outputURL = buildOutputURL(for: video.url, platform: platform)
+        removeFileIfPresent(at: outputURL)
 
         do {
-            let args = buildFFmpegArgs(
-                video: video,
-                platform: platform,
-                ffmpegPath: ffmpeg,
-                outputPath: outputPath
-            )
+            var plan = try makePlan(video: video, edit: edit, platform: platform)
 
-            let needsTwoPass = shouldUseTwoPass(video: video, platform: platform)
-
-            if needsTwoPass {
-                // Pass 1
-                let pass1Args = buildPass1Args(
-                    video: video,
-                    platform: platform,
-                    ffmpegPath: ffmpeg,
-                    outputPath: outputPath
-                )
-                try await runFFmpeg(path: ffmpeg, args: pass1Args, duration: effectiveDuration(video: video, platform: platform), passNumber: 1)
-
-                // Pass 2
-                let pass2Args = buildPass2Args(
-                    video: video,
-                    platform: platform,
-                    ffmpegPath: ffmpeg,
-                    outputPath: outputPath
-                )
-                try await runFFmpeg(path: ffmpeg, args: pass2Args, duration: effectiveDuration(video: video, platform: platform), passNumber: 2)
-
-                // Clean up two-pass log files
-                let logFiles = ["ffmpeg2pass-0.log", "ffmpeg2pass-0.log.mbtree"]
-                for logFile in logFiles {
-                    try? FileManager.default.removeItem(atPath: logFile)
+            if plan.useStreamCopy {
+                statusMessage = "Already within the limit — finishing without quality loss…"
+                let args = baseArguments + [
+                    "-i", video.url.path,
+                    "-map", "0:v:0",
+                    "-map", "0:a?",
+                    "-c", "copy",
+                    "-movflags", "+faststart",
+                    outputURL.path
+                ]
+                do {
+                    try await runFFmpeg(
+                        path: ffmpeg,
+                        args: args,
+                        duration: video.duration,
+                        progressRange: 0...0.96
+                    )
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    // A source can have a compatible video track but an audio
+                    // codec that cannot be copied into MP4. Re-encoding is a
+                    // dependable fallback and needs no extra decision from the user.
+                    removeFileIfPresent(at: outputURL)
+                    progress = 0
+                    statusMessage = "Converting for compatibility…"
+                    try await transcode(
+                        video: video,
+                        plan: &plan,
+                        platform: platform,
+                        ffmpegPath: ffmpeg,
+                        outputURL: outputURL
+                    )
                 }
             } else {
-                try await runFFmpeg(path: ffmpeg, args: args, duration: effectiveDuration(video: video, platform: platform), passNumber: nil)
+                try await transcode(
+                    video: video,
+                    plan: &plan,
+                    platform: platform,
+                    ffmpegPath: ffmpeg,
+                    outputURL: outputURL
+                )
             }
 
-            if FileManager.default.fileExists(atPath: outputPath) {
-                let attrs = try FileManager.default.attributesOfItem(atPath: outputPath)
-                self.outputFileSize = attrs[.size] as? Int64 ?? 0
-                self.outputURL = outputURL
-            } else {
-                self.error = "Output file was not created"
-            }
+            try validate(outputURL: outputURL, platform: platform)
+            let attributes = try FileManager.default.attributesOfItem(atPath: outputURL.path)
+            outputFileSize = attributes[.size] as? Int64 ?? 0
+            self.outputURL = outputURL
+            progress = 1
+            statusMessage = "Done"
+        } catch is CancellationError {
+            removeFileIfPresent(at: outputURL)
+            statusMessage = "Cancelled"
         } catch {
-            if !Task.isCancelled {
+            removeFileIfPresent(at: outputURL)
+            if !cancellationState.get() {
                 self.error = error.localizedDescription
+                self.errorDetails = (error as? CompressionFailure)?.diagnosticDetails
             }
         }
 
+        process = nil
         isCompressing = false
     }
 
     func cancel() {
+        cancellationState.set(true)
         process?.terminate()
-        process = nil
-        isCompressing = false
+        statusMessage = "Cancelling…"
+    }
+
+    func reset() {
         progress = 0
+        error = nil
+        errorDetails = nil
+        outputURL = nil
+        outputFileSize = 0
+        statusMessage = ""
     }
 
-    // MARK: - Private
+    // MARK: - Planning
 
-    private func buildOutputPath(for inputURL: URL, platform: Platform) -> String {
-        let dir = inputURL.deletingLastPathComponent().path
-        let name = inputURL.deletingPathExtension().lastPathComponent
-        return "\(dir)/\(name)\(platform.fileSuffix).mp4"
-    }
+    private func makePlan(video: VideoInfo, edit: VideoEdit, platform: Platform) throws -> CompressionPlan {
+        let segments = edit.segments(for: video.duration)
+        let editedDuration = segments.reduce(0) { $0 + $1.duration }
+        guard editedDuration > 0.05 else { throw CompressionFailure.noVideoLeft }
 
-    private func effectiveDuration(video: VideoInfo, platform: Platform) -> Double {
-        if let maxDur = platform.maxDuration, video.duration > maxDur {
-            return maxDur
+        let timelineChanged = edit.hasTimelineEdits(for: video.duration)
+        let platformCompatible = isStreamCopyCompatible(video: video, platform: platform)
+        let underLimit = video.fileSize < platform.workingFileSize
+        let useStreamCopy = !timelineChanged && underLimit && platformCompatible
+
+        let requiredDurationSpeed: Double
+        if let maximumDuration = platform.maxDuration {
+            requiredDurationSpeed = max(1, editedDuration / maximumDuration)
+        } else {
+            requiredDurationSpeed = 1
         }
-        return video.duration
-    }
 
-    private func speedFactor(video: VideoInfo, platform: Platform) -> Double? {
-        guard let maxDur = platform.maxDuration, video.duration > maxDur else { return nil }
-        return video.duration / maxDur
-    }
+        let baseOutputDuration = editedDuration / requiredDurationSpeed
+        let baseTotalBitrate = Double(platform.workingFileSize) * 8 / max(0.1, baseOutputDuration)
+        let desiredVideoBitrate = desiredQualityBitrate(video: video, platform: platform)
+        let desiredAudioBitrate = video.hasAudio ? 128_000.0 : 0
+        let desiredTotalBitrate = desiredVideoBitrate + desiredAudioBitrate
 
-    private func targetBitrate(video: VideoInfo, platform: Platform) -> Int {
-        let duration = effectiveDuration(video: video, platform: platform)
-        let targetBytes = Double(platform.maxFileSize) * 0.95
-        let targetBits = targetBytes * 8
-        let audioBits = 128_000.0 * duration
-        let videoBits = targetBits - audioBits
-        return max(500_000, Int(videoBits / duration))
-    }
+        let qualityRatio = max(1, desiredTotalBitrate / max(1, baseTotalBitrate))
+        var speed = requiredDurationSpeed * pow(qualityRatio, edit.clarityPreference)
 
-    private func targetResolution(video: VideoInfo, platform: Platform) -> (Int, Int)? {
-        let bitrate = targetBitrate(video: video, platform: platform)
-        let w = Int(video.resolution.width)
-        let h = Int(video.resolution.height)
-
-        if bitrate < 1_000_000 && (w > 1280 || h > 720) {
-            return (1280, 720)
+        // Below this rate, a valid MP4 leaves almost nothing for video. In that
+        // extreme case a little additional speed is necessary even at "Keep timing".
+        let technicalMinimum = video.hasAudio ? 72_000.0 : 32_000.0
+        if baseTotalBitrate < technicalMinimum {
+            speed = max(speed, requiredDurationSpeed * technicalMinimum / max(1, baseTotalBitrate))
         }
-        if w > 1920 || h > 1080 {
-            return (1920, 1080)
+
+        let outputDuration = editedDuration / speed
+        let totalBitrate = Double(platform.workingFileSize) * 8 / max(0.1, outputDuration)
+        let audioBitrate = chooseAudioBitrate(totalBitrate: totalBitrate, hasAudio: video.hasAudio)
+        let videoBitrate = max(24_000, Int(totalBitrate) - audioBitrate)
+        let frameRate = chooseFrameRate(
+            source: video.frameRate,
+            videoBitrate: videoBitrate,
+            platformMaximum: platform.maximumFrameRate
+        )
+        let resolution = chooseResolution(
+            source: video.resolution,
+            videoBitrate: videoBitrate,
+            frameRate: frameRate,
+            platform: platform
+        )
+
+        return CompressionPlan(
+            segments: segments,
+            editedDuration: editedDuration,
+            speed: speed,
+            outputDuration: outputDuration,
+            videoBitrate: videoBitrate,
+            audioBitrate: audioBitrate,
+            width: resolution.width,
+            height: resolution.height,
+            frameRate: frameRate,
+            useStreamCopy: useStreamCopy
+        )
+    }
+
+    private func isStreamCopyCompatible(video: VideoInfo, platform: Platform) -> Bool {
+        switch platform {
+        case .discord:
+            return ["h264", "hevc", "av1"].contains(video.videoCodec)
+        case .twitter:
+            guard video.videoCodec == "h264",
+                  video.duration <= 140.05,
+                  video.frameRate <= 40.05 else { return false }
+            let width = video.resolution.width
+            let height = video.resolution.height
+            let resolutionFits = width >= height
+                ? width <= 1920 && height <= 1200
+                : width <= 1200 && height <= 1900
+            let aspect = width / max(1, height)
+            return resolutionFits && aspect >= (1 / 2.39) && aspect <= 2.39
         }
-        return nil
     }
 
-    private func crf(video: VideoInfo, platform: Platform) -> Int {
-        let duration = effectiveDuration(video: video, platform: platform)
-        if duration < 30 { return 20 }
-        if duration < 120 { return 23 }
-        return 26
+    private func desiredQualityBitrate(video: VideoInfo, platform: Platform) -> Double {
+        let cappedFrameRate = min(max(15, video.frameRate), platform.maximumFrameRate)
+        let dimensions = maximumDimensions(for: video.resolution, platform: platform)
+        let pixelBasedRate = Double(dimensions.width * dimensions.height) * cappedFrameRate * 0.05
+        let sourceRate = video.estimatedVideoBitrate > 0 ? video.estimatedVideoBitrate : pixelBasedRate
+        return min(12_000_000, max(350_000, min(pixelBasedRate, sourceRate * 1.05)))
     }
 
-    private func shouldUseTwoPass(video: VideoInfo, platform: Platform) -> Bool {
-        let bitrate = targetBitrate(video: video, platform: platform)
-        return bitrate < 4_000_000
+    private func chooseAudioBitrate(totalBitrate: Double, hasAudio: Bool) -> Int {
+        guard hasAudio else { return 0 }
+        switch totalBitrate {
+        case 1_000_000...: return 128_000
+        case 450_000...: return 96_000
+        case 220_000...: return 64_000
+        case 120_000...: return 48_000
+        case 72_000...: return 32_000
+        default: return 24_000
+        }
     }
 
-    private func buildVideoFilters(video: VideoInfo, platform: Platform) -> [String] {
+    private func chooseFrameRate(source: Double, videoBitrate: Int, platformMaximum: Double) -> Double {
+        let sourceRate = min(max(12, source), platformMaximum)
+        switch videoBitrate {
+        case ..<220_000: return min(sourceRate, 15)
+        case ..<600_000: return min(sourceRate, 24)
+        case ..<1_400_000: return min(sourceRate, 30)
+        default: return sourceRate
+        }
+    }
+
+    private func chooseResolution(
+        source: CGSize,
+        videoBitrate: Int,
+        frameRate: Double,
+        platform: Platform
+    ) -> (width: Int, height: Int) {
+        let maximum = maximumDimensions(for: source, platform: platform)
+        let maximumPixels = Double(maximum.width * maximum.height)
+        let affordablePixels = Double(videoBitrate) / max(1, frameRate * 0.065)
+        let scale = min(1, sqrt(affordablePixels / max(1, maximumPixels)))
+
+        var width = even(Int(Double(maximum.width) * scale))
+        var height = even(Int(Double(maximum.height) * scale))
+
+        if width < 160 || height < 90 {
+            let aspect = Double(maximum.width) / Double(max(1, maximum.height))
+            if aspect >= 1 {
+                width = 160
+                height = even(max(90, Int(160 / aspect)))
+            } else {
+                height = 160
+                width = even(max(90, Int(160 * aspect)))
+            }
+        }
+        return (width, height)
+    }
+
+    private func maximumDimensions(for source: CGSize, platform: Platform) -> (width: Int, height: Int) {
+        let sourceWidth = max(2, Int(source.width))
+        let sourceHeight = max(2, Int(source.height))
+        let landscape = sourceWidth >= sourceHeight
+        let caps: (width: Int, height: Int)
+
+        switch platform {
+        case .twitter:
+            caps = landscape ? (1920, 1200) : (1200, 1900)
+        case .discord:
+            caps = landscape ? (1920, 1080) : (1080, 1920)
+        }
+
+        let scale = min(
+            1,
+            min(Double(caps.width) / Double(sourceWidth), Double(caps.height) / Double(sourceHeight))
+        )
+        return (
+            even(max(2, Int(Double(sourceWidth) * scale))),
+            even(max(2, Int(Double(sourceHeight) * scale)))
+        )
+    }
+
+    private func even(_ value: Int) -> Int {
+        max(2, value - abs(value % 2))
+    }
+
+    // MARK: - Encoding
+
+    private var baseArguments: [String] {
+        ["-hide_banner", "-nostdin", "-y", "-progress", "pipe:1", "-nostats"]
+    }
+
+    private func transcode(
+        video: VideoInfo,
+        plan: inout CompressionPlan,
+        platform: Platform,
+        ffmpegPath: String,
+        outputURL: URL
+    ) async throws {
+        let passLog = FileManager.default.temporaryDirectory
+            .appendingPathComponent("QwikVidCompressor-\(UUID().uuidString)")
+            .path
+        defer { cleanPassLogs(prefix: passLog) }
+
+        for attempt in 0..<3 {
+            removeFileIfPresent(at: outputURL)
+            cleanPassLogs(prefix: passLog)
+
+            statusMessage = attempt == 0 ? "Analyzing video…" : "Tightening file size…"
+            let pass1 = buildTranscodeArguments(
+                video: video,
+                plan: plan,
+                outputPath: outputURL.path,
+                passLog: passLog,
+                pass: 1
+            )
+            try await runFFmpeg(
+                path: ffmpegPath,
+                args: pass1,
+                duration: plan.outputDuration,
+                progressRange: 0...0.48
+            )
+
+            statusMessage = "Encoding final video…"
+            let pass2 = buildTranscodeArguments(
+                video: video,
+                plan: plan,
+                outputPath: outputURL.path,
+                passLog: passLog,
+                pass: 2
+            )
+            try await runFFmpeg(
+                path: ffmpegPath,
+                args: pass2,
+                duration: plan.outputDuration,
+                progressRange: 0.48...0.96
+            )
+
+            let size = fileSize(at: outputURL)
+            if size <= platform.maxFileSize {
+                return
+            }
+
+            let ratio = Double(platform.workingFileSize) / Double(max(1, size))
+            plan.videoBitrate = max(24_000, Int(Double(plan.videoBitrate) * ratio * 0.97))
+        }
+
+        throw CompressionFailure.outputTooLarge(
+            actual: fileSize(at: outputURL),
+            limit: platform.maxFileSize
+        )
+    }
+
+    private func buildTranscodeArguments(
+        video: VideoInfo,
+        plan: CompressionPlan,
+        outputPath: String,
+        passLog: String,
+        pass: Int
+    ) -> [String] {
+        let includeAudio = pass == 2 && video.hasAudio
+        let filterGraph = buildFilterGraph(video: video, plan: plan, includeAudio: includeAudio)
+
+        var arguments = baseArguments + [
+            "-i", video.url.path,
+            "-filter_complex", filterGraph,
+            "-map", "[vout]",
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-profile:v", "main",
+            "-pix_fmt", "yuv420p",
+            "-b:v", "\(plan.videoBitrate)",
+            "-maxrate", "\(Int(Double(plan.videoBitrate) * 1.15))",
+            "-bufsize", "\(plan.videoBitrate * 2)",
+            "-pass", "\(pass)",
+            "-passlogfile", passLog
+        ]
+
+        if pass == 1 {
+            arguments += ["-an", "-f", "null", "/dev/null"]
+        } else {
+            if includeAudio {
+                arguments += ["-map", "[aout]", "-c:a", "aac", "-b:a", "\(plan.audioBitrate)"]
+            } else {
+                arguments += ["-an"]
+            }
+            arguments += [
+                "-tag:v", "avc1",
+                "-movflags", "+faststart",
+                outputPath
+            ]
+        }
+        return arguments
+    }
+
+    private func buildFilterGraph(video: VideoInfo, plan: CompressionPlan, includeAudio: Bool) -> String {
         var filters: [String] = []
+        var videoLabels: [String] = []
+        var audioLabels: [String] = []
 
-        if let speed = speedFactor(video: video, platform: platform) {
-            filters.append("setpts=PTS/\(String(format: "%.4f", speed))")
+        for (index, segment) in plan.segments.enumerated() {
+            let start = ffmpegNumber(segment.start)
+            let end = ffmpegNumber(segment.end)
+            let videoLabel = "vsegment\(index)"
+            filters.append("[0:v:0]trim=start=\(start):end=\(end),setpts=PTS-STARTPTS[\(videoLabel)]")
+            videoLabels.append("[\(videoLabel)]")
+
+            if includeAudio {
+                let audioLabel = "asegment\(index)"
+                filters.append("[0:a:0]atrim=start=\(start):end=\(end),asetpts=PTS-STARTPTS[\(audioLabel)]")
+                audioLabels.append("[\(audioLabel)]")
+            }
         }
 
-        if let (w, h) = targetResolution(video: video, platform: platform) {
-            filters.append("scale=\(w):\(h):force_original_aspect_ratio=decrease")
-            filters.append("pad=\(w):\(h):(ow-iw)/2:(oh-ih)/2")
+        if videoLabels.count == 1 {
+            filters.append("\(videoLabels[0])null[vjoined]")
+        } else {
+            filters.append("\(videoLabels.joined())concat=n=\(videoLabels.count):v=1:a=0[vjoined]")
         }
 
-        return filters
+        var videoTransforms = ["setpts=PTS/\(ffmpegNumber(plan.speed))"]
+        videoTransforms.append("scale=\(plan.width):\(plan.height):flags=lanczos")
+        videoTransforms.append("fps=\(ffmpegNumber(plan.frameRate))")
+        videoTransforms.append("setsar=1")
+        filters.append("[vjoined]\(videoTransforms.joined(separator: ","))[vout]")
+
+        if includeAudio {
+            if audioLabels.count == 1 {
+                filters.append("\(audioLabels[0])anull[ajoined]")
+            } else {
+                filters.append("\(audioLabels.joined())concat=n=\(audioLabels.count):v=0:a=1[ajoined]")
+            }
+
+            let tempoFilters = audioTempoFilters(speed: plan.speed)
+            if tempoFilters.isEmpty {
+                filters.append("[ajoined]anull[aout]")
+            } else {
+                filters.append("[ajoined]\(tempoFilters.joined(separator: ","))[aout]")
+            }
+        }
+
+        return filters.joined(separator: ";")
     }
 
-    private func buildAudioFilters(video: VideoInfo, platform: Platform) -> [String] {
-        guard let speed = speedFactor(video: video, platform: platform) else { return [] }
-
-        // atempo filter supports 0.5 to 100.0 but for quality, chain at max 2.0x each
-        var filters: [String] = []
+    private func audioTempoFilters(speed: Double) -> [String] {
+        guard abs(speed - 1) > 0.0001 else { return [] }
         var remaining = speed
-        while remaining > 1.0 {
-            let factor = min(remaining, 2.0)
-            filters.append("atempo=\(String(format: "%.4f", factor))")
-            remaining /= factor
+        var filters: [String] = []
+
+        while remaining > 2.0 {
+            filters.append("atempo=2.0")
+            remaining /= 2.0
         }
+        while remaining < 0.5 {
+            filters.append("atempo=0.5")
+            remaining /= 0.5
+        }
+        filters.append("atempo=\(ffmpegNumber(remaining))")
         return filters
     }
 
-    private func buildFFmpegArgs(video: VideoInfo, platform: Platform, ffmpegPath: String, outputPath: String) -> [String] {
-        var args = ["-y", "-i", video.url.path]
-
-        let videoFilters = buildVideoFilters(video: video, platform: platform)
-        let audioFilters = buildAudioFilters(video: video, platform: platform)
-        let br = targetBitrate(video: video, platform: platform)
-        let crfVal = crf(video: video, platform: platform)
-
-        args += ["-c:v", "libx264"]
-        args += ["-profile:v", "main"]
-        args += ["-pix_fmt", "yuv420p"]
-        args += ["-crf", "\(crfVal)"]
-        args += ["-maxrate", "\(br)"]
-        args += ["-bufsize", "\(br * 2)"]
-
-        if !videoFilters.isEmpty {
-            args += ["-vf", videoFilters.joined(separator: ",")]
-        }
-
-        if !audioFilters.isEmpty {
-            args += ["-af", audioFilters.joined(separator: ",")]
-        }
-
-        args += ["-c:a", "aac", "-b:a", "128k"]
-        args += ["-movflags", "+faststart"]
-        args += [outputPath]
-
-        return args
+    private func ffmpegNumber(_ value: Double) -> String {
+        String(format: "%.6f", locale: Locale(identifier: "en_US_POSIX"), value)
     }
 
-    private func buildPass1Args(video: VideoInfo, platform: Platform, ffmpegPath: String, outputPath: String) -> [String] {
-        var args = ["-y", "-i", video.url.path]
+    // MARK: - Process handling
 
-        let videoFilters = buildVideoFilters(video: video, platform: platform)
-        let br = targetBitrate(video: video, platform: platform)
-
-        args += ["-c:v", "libx264"]
-        args += ["-profile:v", "main"]
-        args += ["-pix_fmt", "yuv420p"]
-        args += ["-b:v", "\(br)"]
-        args += ["-maxrate", "\(br)"]
-        args += ["-bufsize", "\(br * 2)"]
-
-        if !videoFilters.isEmpty {
-            args += ["-vf", videoFilters.joined(separator: ",")]
-        }
-
-        args += ["-pass", "1"]
-        args += ["-an"]
-        args += ["-f", "null", "/dev/null"]
-
-        return args
-    }
-
-    private func buildPass2Args(video: VideoInfo, platform: Platform, ffmpegPath: String, outputPath: String) -> [String] {
-        var args = ["-y", "-i", video.url.path]
-
-        let videoFilters = buildVideoFilters(video: video, platform: platform)
-        let audioFilters = buildAudioFilters(video: video, platform: platform)
-        let br = targetBitrate(video: video, platform: platform)
-
-        args += ["-c:v", "libx264"]
-        args += ["-profile:v", "main"]
-        args += ["-pix_fmt", "yuv420p"]
-        args += ["-b:v", "\(br)"]
-        args += ["-maxrate", "\(br)"]
-        args += ["-bufsize", "\(br * 2)"]
-
-        if !videoFilters.isEmpty {
-            args += ["-vf", videoFilters.joined(separator: ",")]
-        }
-
-        args += ["-pass", "2"]
-
-        if !audioFilters.isEmpty {
-            args += ["-af", audioFilters.joined(separator: ",")]
-        }
-
-        args += ["-c:a", "aac", "-b:a", "128k"]
-        args += ["-movflags", "+faststart"]
-        args += [outputPath]
-
-        return args
-    }
-
-    private func runFFmpeg(path: String, args: [String], duration: Double, passNumber: Int?) async throws {
+    private func runFFmpeg(
+        path: String,
+        args: [String],
+        duration: Double,
+        progressRange: ClosedRange<Double>
+    ) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             let process = Process()
             process.executableURL = URL(fileURLWithPath: path)
             process.arguments = args
 
-            let pipe = Pipe()
-            process.standardError = pipe
+            let progressPipe = Pipe()
+            let errorPipe = Pipe()
+            let progressBuffer = LockedTextBuffer()
+            let errorBuffer = LockedTextBuffer()
+            let gate = ContinuationGate()
+            let cancellationState = self.cancellationState
 
-            nonisolated(unsafe) var continued = false
-            let resume: @Sendable (Result<Void, Error>) -> Void = { result in
-                guard !continued else { return }
-                continued = true
-                continuation.resume(with: result)
-            }
+            process.standardOutput = progressPipe
+            process.standardError = errorPipe
 
-            pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            progressPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
                 let data = handle.availableData
-                guard !data.isEmpty, let output = String(data: data, encoding: .utf8) else { return }
-
-                if let timeMatch = output.range(of: #"time=(\d+):(\d+):(\d+\.\d+)"#, options: .regularExpression) {
-                    let timeStr = String(output[timeMatch])
-                    let components = timeStr.replacingOccurrences(of: "time=", with: "").split(separator: ":")
-                    if components.count == 3,
-                       let h = Double(components[0]),
-                       let m = Double(components[1]),
-                       let s = Double(components[2]) {
-                        let currentTime = h * 3600 + m * 60 + s
-                        let rawProgress = min(currentTime / max(duration, 1), 1.0)
-
-                        let adjustedProgress: Double
-                        if let pass = passNumber {
-                            adjustedProgress = pass == 1 ? rawProgress * 0.5 : 0.5 + rawProgress * 0.5
-                        } else {
-                            adjustedProgress = rawProgress
-                        }
-
-                        DispatchQueue.main.async {
-                            self?.progress = adjustedProgress
-                        }
-                    }
+                guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
+                progressBuffer.append(chunk)
+                let latest = progressBuffer.contents()
+                let seconds = Self.latestProgressSeconds(in: latest)
+                guard let seconds else { return }
+                let fraction = min(max(0, seconds / max(0.1, duration)), 1)
+                let adjusted = progressRange.lowerBound + fraction * (progressRange.upperBound - progressRange.lowerBound)
+                Task { @MainActor [weak self] in
+                    self?.progress = adjusted
                 }
             }
 
-            process.terminationHandler = { proc in
-                pipe.fileHandleForReading.readabilityHandler = nil
-                if proc.terminationStatus == 0 {
-                    resume(.success(()))
+            errorPipe.fileHandleForReading.readabilityHandler = { handle in
+                let data = handle.availableData
+                guard !data.isEmpty, let chunk = String(data: data, encoding: .utf8) else { return }
+                errorBuffer.append(chunk)
+            }
+
+            process.terminationHandler = { [weak self] finishedProcess in
+                progressPipe.fileHandleForReading.readabilityHandler = nil
+                errorPipe.fileHandleForReading.readabilityHandler = nil
+
+                let remainingErrorData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+                if !remainingErrorData.isEmpty,
+                   let remainingError = String(data: remainingErrorData, encoding: .utf8) {
+                    errorBuffer.append(remainingError)
+                }
+
+                Task { @MainActor [weak self] in
+                    self?.process = nil
+                }
+
+                if finishedProcess.terminationStatus == 0 {
+                    gate.resume(continuation, with: .success(()))
+                } else if cancellationState.get() {
+                    gate.resume(continuation, with: .failure(CancellationError()))
                 } else {
-                    resume(.failure(NSError(
-                        domain: "VideoCompressor",
-                        code: Int(proc.terminationStatus),
-                        userInfo: [NSLocalizedDescriptionKey: "FFmpeg exited with code \(proc.terminationStatus)"]
-                    )))
+                    let details = errorBuffer.contents()
+                    let message = Self.friendlyFFmpegMessage(from: details)
+                    gate.resume(
+                        continuation,
+                        with: .failure(CompressionFailure.ffmpeg(
+                            status: finishedProcess.terminationStatus,
+                            message: message,
+                            details: Self.tail(of: details)
+                        ))
+                    )
                 }
             }
 
             self.process = process
-
             do {
                 try process.run()
             } catch {
-                resume(.failure(error))
+                progressPipe.fileHandleForReading.readabilityHandler = nil
+                errorPipe.fileHandleForReading.readabilityHandler = nil
+                gate.resume(continuation, with: .failure(error))
             }
+        }
+    }
+
+    nonisolated private static func latestProgressSeconds(in output: String) -> Double? {
+        let lines = output.split(whereSeparator: \Character.isNewline)
+        for line in lines.reversed() {
+            if line.hasPrefix("out_time_us="),
+               let microseconds = Double(line.dropFirst("out_time_us=".count)) {
+                return microseconds / 1_000_000
+            }
+            if line.hasPrefix("out_time_ms="),
+               let microseconds = Double(line.dropFirst("out_time_ms=".count)) {
+                return microseconds / 1_000_000
+            }
+        }
+        return nil
+    }
+
+    nonisolated private static func friendlyFFmpegMessage(from details: String) -> String {
+        if details.localizedCaseInsensitiveContains("can't open stats file") {
+            return "FFmpeg could not create its temporary analysis files."
+        }
+        if details.localizedCaseInsensitiveContains("No space left on device") {
+            return "There is not enough free disk space to finish this video."
+        }
+        if details.localizedCaseInsensitiveContains("Permission denied") {
+            return "The app does not have permission to read the source or save beside it."
+        }
+        if details.localizedCaseInsensitiveContains("Invalid data found") {
+            return "FFmpeg could not read this video. The file may be incomplete or damaged."
+        }
+
+        let usefulLine = details
+            .split(whereSeparator: \Character.isNewline)
+            .map(String.init)
+            .reversed()
+            .first { line in
+                let lower = line.lowercased()
+                return !line.isEmpty
+                    && !lower.contains("conversion failed")
+                    && !lower.contains("nothing was written")
+                    && (lower.contains("error") || lower.contains("failed") || lower.contains("invalid"))
+            }
+        return usefulLine.map { "Compression failed: \($0)" } ?? "FFmpeg could not compress this video."
+    }
+
+    nonisolated private static func tail(of details: String) -> String {
+        details
+            .split(whereSeparator: \Character.isNewline)
+            .suffix(18)
+            .joined(separator: "\n")
+    }
+
+    // MARK: - Output and cleanup
+
+    private func buildOutputURL(for inputURL: URL, platform: Platform) -> URL {
+        let directory = inputURL.deletingLastPathComponent()
+        let name = inputURL.deletingPathExtension().lastPathComponent
+        return directory.appendingPathComponent("\(name)\(platform.fileSuffix).mp4")
+    }
+
+    private func validate(outputURL: URL, platform: Platform) throws {
+        guard FileManager.default.fileExists(atPath: outputURL.path) else {
+            throw CompressionFailure.couldNotCreateOutput
+        }
+        let size = fileSize(at: outputURL)
+        guard size <= platform.maxFileSize else {
+            throw CompressionFailure.outputTooLarge(actual: size, limit: platform.maxFileSize)
+        }
+    }
+
+    private func fileSize(at url: URL) -> Int64 {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        return attributes?[.size] as? Int64 ?? 0
+    }
+
+    private func removeFileIfPresent(at url: URL) {
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    private func cleanPassLogs(prefix: String) {
+        let paths = [
+            "\(prefix)-0.log",
+            "\(prefix)-0.log.mbtree",
+            "\(prefix).log",
+            "\(prefix).log.mbtree"
+        ]
+        for path in paths where FileManager.default.fileExists(atPath: path) {
+            try? FileManager.default.removeItem(atPath: path)
         }
     }
 }
